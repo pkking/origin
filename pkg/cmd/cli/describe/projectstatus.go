@@ -266,7 +266,7 @@ func (d *ProjectStatusDescriber) Describe(namespace, name string) (string, error
 
 		allMarkers := osgraph.Markers{}
 		allMarkers = append(allMarkers, createForbiddenMarkers(forbiddenResources)...)
-		for _, scanner := range getMarkerScanners(d.LogsCommandName, d.SecurityPolicyCommandFormat, d.SetProbeCommandName) {
+		for _, scanner := range getMarkerScanners(d.LogsCommandName, d.SecurityPolicyCommandFormat, d.SetProbeCommandName, forbiddenResources) {
 			allMarkers = append(allMarkers, scanner(g, f)...)
 		}
 
@@ -282,44 +282,31 @@ func (d *ProjectStatusDescriber) Describe(namespace, name string) (string, error
 		errorSuggestions := 0
 		if len(errorMarkers) > 0 {
 			fmt.Fprintln(out, "Errors:")
-			for _, marker := range errorMarkers {
-				fmt.Fprintln(out, indent+"* "+marker.Message)
-				if len(marker.Suggestion) > 0 {
-					errorSuggestions++
-					if d.Suggest {
-						switch s := marker.Suggestion.String(); {
-						case strings.Contains(s, "\n"):
-							fmt.Fprintln(out)
-							for _, line := range strings.Split(s, "\n") {
-								fmt.Fprintln(out, indent+"  "+line)
-							}
-						case len(s) > 0:
-							fmt.Fprintln(out, indent+"  try: "+s)
-						}
-					}
-				}
-			}
+			errorSuggestions += printMarkerSuggestions(errorMarkers, d.Suggest, out, indent)
 		}
 
 		warningMarkers := allMarkers.BySeverity(osgraph.WarningSeverity)
 		if len(warningMarkers) > 0 {
 			if d.Suggest {
+				// add linebreak between Errors list and Warnings list
+				if len(errorMarkers) > 0 {
+					fmt.Fprintln(out)
+				}
 				fmt.Fprintln(out, "Warnings:")
 			}
-			for _, marker := range warningMarkers {
-				if d.Suggest {
-					fmt.Fprintln(out, indent+"* "+marker.Message)
-					switch s := marker.Suggestion.String(); {
-					case strings.Contains(s, "\n"):
-						fmt.Fprintln(out)
-						for _, line := range strings.Split(s, "\n") {
-							fmt.Fprintln(out, indent+"  "+line)
-						}
-					case len(s) > 0:
-						fmt.Fprintln(out, indent+"  try: "+s)
-					}
+			printMarkerSuggestions(warningMarkers, d.Suggest, out, indent)
+		}
+
+		infoMarkers := allMarkers.BySeverity(osgraph.InfoSeverity)
+		if len(infoMarkers) > 0 {
+			if d.Suggest {
+				// add linebreak between Warnings list and Info List
+				if len(warningMarkers) > 0 || len(errorMarkers) > 0 {
+					fmt.Fprintln(out)
 				}
+				fmt.Fprintln(out, "Info:")
 			}
+			printMarkerSuggestions(infoMarkers, d.Suggest, out, indent)
 		}
 
 		// We print errors by default and warnings if -v is used. If we get none,
@@ -362,6 +349,32 @@ func (d *ProjectStatusDescriber) Describe(namespace, name string) (string, error
 	})
 }
 
+// printMarkerSuggestions prints a formatted list of marker suggestions
+// and returns the amount of suggestions printed
+func printMarkerSuggestions(markers []osgraph.Marker, suggest bool, out *tabwriter.Writer, indent string) int {
+	suggestionAmount := 0
+	for _, marker := range markers {
+		if len(marker.Suggestion) > 0 {
+			suggestionAmount++
+		}
+		if len(marker.Suggestion) > 0 || len(marker.Message) > 0 {
+			if suggest {
+				fmt.Fprintln(out, indent+"* "+marker.Message)
+				switch s := marker.Suggestion.String(); {
+				case strings.Contains(s, "\n"):
+					fmt.Fprintln(out)
+					for _, line := range strings.Split(s, "\n") {
+						fmt.Fprintln(out, indent+"  "+line)
+					}
+				case len(s) > 0:
+					fmt.Fprintln(out, indent+"  try: "+s)
+				}
+			}
+		}
+	}
+	return suggestionAmount
+}
+
 func createForbiddenMarkers(forbiddenResources sets.String) []osgraph.Marker {
 	markers := []osgraph.Marker{}
 	for forbiddenResource := range forbiddenResources {
@@ -374,13 +387,19 @@ func createForbiddenMarkers(forbiddenResources sets.String) []osgraph.Marker {
 	return markers
 }
 
-func getMarkerScanners(logsCommandName, securityPolicyCommandFormat, setProbeCommandName string) []osgraph.MarkerScanner {
+func getMarkerScanners(logsCommandName, securityPolicyCommandFormat, setProbeCommandName string, forbiddenResources sets.String) []osgraph.MarkerScanner {
 	return []osgraph.MarkerScanner{
 		func(g osgraph.Graph, f osgraph.Namer) []osgraph.Marker {
 			return kubeanalysis.FindRestartingPods(g, f, logsCommandName, securityPolicyCommandFormat)
 		},
 		kubeanalysis.FindDuelingReplicationControllers,
-		kubeanalysis.FindMissingSecrets,
+		func(g osgraph.Graph, f osgraph.Namer) []osgraph.Marker {
+			// do not attempt to add markers for missing secrets if dealing with forbidden errors
+			if forbiddenResources.Has("secrets") {
+				return []osgraph.Marker{}
+			}
+			return kubeanalysis.FindMissingSecrets(g, f)
+		},
 		kubeanalysis.FindHPASpecsMissingCPUTargets,
 		kubeanalysis.FindHPASpecsMissingScaleRefs,
 		kubeanalysis.FindOverlappingHPAs,

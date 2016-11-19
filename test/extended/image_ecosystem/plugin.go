@@ -292,14 +292,28 @@ func (j *JenkinsRef) startJob(jobName string) *JobMon {
 
 // Returns the content of a Jenkins job XML file. Instances of the
 // string "PROJECT_NAME" are replaced with the specified namespace.
-func (j *JenkinsRef) readJenkinsJob(filename, namespace string) string {
+// Variables named in the vars map will also be replaced with their
+// corresponding value.
+func (j *JenkinsRef) readJenkinsJobUsingVars(filename, namespace string, vars map[string]string) string {
 	pre := exutil.FixturePath("testdata", "jenkins-plugin", filename)
 	post := exutil.ArtifactPath(filename)
-	err := exutil.VarSubOnFile(pre, post, "PROJECT_NAME", namespace)
+
+	if vars == nil {
+		vars = map[string]string{}
+	}
+	vars["PROJECT_NAME"] = namespace
+	err := exutil.VarSubOnFile(pre, post, vars)
 	o.ExpectWithOffset(1, err).NotTo(o.HaveOccurred())
+
 	data, err := ioutil.ReadFile(post)
 	o.ExpectWithOffset(1, err).NotTo(o.HaveOccurred())
 	return string(data)
+}
+
+// Returns the content of a Jenkins job XML file. Instances of the
+// string "PROJECT_NAME" are replaced with the specified namespace.
+func (j *JenkinsRef) readJenkinsJob(filename, namespace string) string {
+	return j.readJenkinsJobUsingVars(filename, namespace, nil)
 }
 
 // Returns an XML string defining a Jenkins workflow/pipeline DSL job. Instances of the
@@ -384,11 +398,43 @@ func getAdminPassword(oc *exutil.CLI) string {
 	return "password"
 }
 
-func followDCLogs(oc *exutil.CLI, jenkinsNamespace string) {
-	oc.SetNamespace(jenkinsNamespace)
-	oc.Run("logs").Args("-f", "dc/jenkins").Execute()
+// Finds the pod running Jenkins
+func findJenkinsPod(oc *exutil.CLI) *kapi.Pod {
+	pods, err := exutil.GetDeploymentConfigPods(oc, "jenkins")
+	o.ExpectWithOffset(1, err).NotTo(o.HaveOccurred())
 
+	if pods == nil || pods.Items == nil {
+		g.Fail("No pods matching jenkins deploymentconfig in namespace " + oc.Namespace())
+	}
+
+	o.ExpectWithOffset(1, len(pods.Items)).To(o.Equal(1))
+	return &pods.Items[0]
 }
+
+// Stands up a simple pod which can be used for exec commands
+func initExecPod(oc *exutil.CLI) *kapi.Pod {
+	// Create a running pod in which we can execute our commands
+	oc.Run("run").Args("centos", "--image", "centos:7", "--command", "--", "sleep", "1800").Execute()
+
+	var targetPod *kapi.Pod
+	err := wait.Poll(10*time.Second, 10*time.Minute, func() (bool, error) {
+		pods, err := oc.KubeREST().Pods(oc.Namespace()).List(kapi.ListOptions{})
+		o.ExpectWithOffset(1, err).NotTo(o.HaveOccurred())
+		for _, p := range pods.Items {
+			if strings.HasPrefix(p.Name, "centos") && !strings.Contains(p.Name, "deploy") && p.Status.Phase == "Running" {
+				targetPod = &p
+				return true, nil
+			}
+		}
+		return false, nil
+	})
+	o.ExpectWithOffset(1, err).NotTo(o.HaveOccurred())
+
+	return targetPod
+}
+
+// Designed to match if RSS memory is greater than 500000000  (i.e. > 476MB)
+var memoryOverragePattern = regexp.MustCompile(`\s+rss\s+5\d\d\d\d\d\d\d\d`)
 
 var _ = g.Describe("[image_ecosystem][jenkins][Slow] openshift pipeline plugin", func() {
 	defer g.GinkgoRecover()
@@ -396,8 +442,13 @@ var _ = g.Describe("[image_ecosystem][jenkins][Slow] openshift pipeline plugin",
 	var j *JenkinsRef
 	var dcLogFollow *exec.Cmd
 	var dcLogStdOut, dcLogStdErr *bytes.Buffer
+	var ticker *time.Ticker
 
 	g.AfterEach(func() {
+
+		ticker.Stop()
+
+		oc.SetNamespace(j.namespace)
 		ginkgolog("Jenkins DC description follows. If there were issues, check to see if there were any restarts in the jenkins pod.")
 		exutil.DumpDeploymentLogs("jenkins", oc)
 
@@ -512,6 +563,42 @@ var _ = g.Describe("[image_ecosystem][jenkins][Slow] openshift pipeline plugin",
 			o.Expect(err).NotTo(o.HaveOccurred())
 		}
 
+		jenkinsPod := findJenkinsPod(oc)
+
+		ticker = time.NewTicker(10 * time.Second)
+		go func() {
+			for t := range ticker.C {
+				memstats, err := oc.Run("exec").Args("--namespace", jenkinsNamespace, jenkinsPod.Name, "--", "cat", "/sys/fs/cgroup/memory/memory.stat").Output()
+				if err != nil {
+					ginkgolog("\nUnable to acquire Jenkins cgroup memory.stat")
+				}
+				ps, err := oc.Run("exec").Args("--namespace", jenkinsNamespace, jenkinsPod.Name, "--", "ps", "faux").Output()
+				if err != nil {
+					ginkgolog("\nUnable to acquire Jenkins ps information")
+				}
+				ginkgolog("\nJenkins memory statistics at %v\n%s\n%s\n\n", t, ps, memstats)
+
+				// This is likely a temporary measure in place to extract diagnostic information during unexpectedly
+				// high memory utilization within the Jenkins image. If Jenkins is using
+				// a large amount of RSS, extract JVM information from the pod.
+				if memoryOverragePattern.MatchString(memstats) {
+					histogram, err := oc.Run("rsh").Args("--namespace", jenkinsNamespace, jenkinsPod.Name, "jmap", "-histo", "1").Output()
+					if err == nil {
+						ginkgolog("\n\nJenkins histogram:\n%s\n\n", histogram)
+					} else {
+						ginkgolog("Unable to acquire Jenkins histogram: %v", err)
+					}
+					stack, err := oc.Run("exec").Args("--namespace", jenkinsNamespace, jenkinsPod.Name, "--", "jstack", "1").Output()
+					if err == nil {
+						ginkgolog("\n\nJenkins thread dump:\n%s\n\n", stack)
+					} else {
+						ginkgolog("Unable to acquire Jenkins thread dump: %v", err)
+					}
+				}
+
+			}
+		}()
+
 		// Start capturing logs from this deployment config.
 		// This command will terminate if the Jekins instance crashes. This
 		// ensures that even if the Jenkins DC restarts, we should capture
@@ -554,6 +641,35 @@ var _ = g.Describe("[image_ecosystem][jenkins][Slow] openshift pipeline plugin",
 
 			g.By("get build console logs and see if succeeded")
 			logs, err := j.waitForContent("Finished: SUCCESS", 200, 10*time.Minute, "job/%s/lastBuild/consoleText", jobName)
+			ginkgolog("\n\nJenkins logs>\n%s\n\n", logs)
+			o.Expect(err).NotTo(o.HaveOccurred())
+
+		})
+
+		g.It("jenkins-plugin test trigger build with slave", func() {
+
+			jobName := "test-build-job-slave"
+			data := j.readJenkinsJob("build-job-slave.xml", oc.Namespace())
+			j.createItem(jobName, data)
+			jmon := j.startJob(jobName)
+			jmon.await(10 * time.Minute)
+
+			// the build and deployment is by far the most time consuming portion of the test jenkins job;
+			// we leverage some of the openshift utilities for waiting for the deployment before we poll
+			// jenkins for the successful job completion
+			g.By("waiting for frontend, frontend-prod deployments as signs that the build has finished")
+			err := exutil.WaitForADeploymentToComplete(oc.KubeREST().ReplicationControllers(oc.Namespace()), "frontend", oc)
+			o.Expect(err).NotTo(o.HaveOccurred())
+			err = exutil.WaitForADeploymentToComplete(oc.KubeREST().ReplicationControllers(oc.Namespace()), "frontend-prod", oc)
+			o.Expect(err).NotTo(o.HaveOccurred())
+
+			g.By("get build console logs and see if succeeded")
+			logs, err := j.waitForContent("Finished: SUCCESS", 200, 10*time.Minute, "job/%s/lastBuild/consoleText", jobName)
+			ginkgolog("\n\nJenkins logs>\n%s\n\n", logs)
+			o.Expect(err).NotTo(o.HaveOccurred())
+
+			g.By("get build console logs and confirm ran on slave")
+			logs, err = j.waitForContent("Building remotely on", 200, 10*time.Minute, "job/%s/lastBuild/consoleText", jobName)
 			ginkgolog("\n\nJenkins logs>\n%s\n\n", logs)
 			o.Expect(err).NotTo(o.HaveOccurred())
 
@@ -629,23 +745,7 @@ var _ = g.Describe("[image_ecosystem][jenkins][Slow] openshift pipeline plugin",
 
 		g.It("jenkins-plugin test exec DSL", func() {
 
-			// Create a running pod in which we can execute our commands
-			oc.Run("new-app").Args("https://github.com/openshift/ruby-hello-world").Execute()
-
-			var targetPod *kapi.Pod
-			err := wait.Poll(10*time.Second, 10*time.Minute, func() (bool, error) {
-				pods, err := oc.KubeREST().Pods(oc.Namespace()).List(kapi.ListOptions{})
-				o.Expect(err).NotTo(o.HaveOccurred())
-				for _, p := range pods.Items {
-					if !strings.Contains(p.Name, "build") && !strings.Contains(p.Name, "deploy") && p.Status.Phase == "Running" {
-						targetPod = &p
-						return true, nil
-					}
-				}
-				return false, nil
-			})
-			o.Expect(err).NotTo(o.HaveOccurred())
-
+			targetPod := initExecPod(oc)
 			targetContainer := targetPod.Spec.Containers[0]
 
 			data, err := j.buildDSLJob(oc.Namespace(),
@@ -674,6 +774,46 @@ var _ = g.Describe("[image_ecosystem][jenkins][Slow] openshift pipeline plugin",
 			o.Expect(strings.Contains(log, "hello world 4")).To(o.BeTrue())
 			o.Expect(strings.Contains(log, "hello world 5")).To(o.BeTrue())
 			o.Expect(strings.Contains(log, "hello world 6")).To(o.BeTrue())
+		})
+
+		g.It("jenkins-plugin test exec freestyle", func() {
+
+			targetPod := initExecPod(oc)
+			targetContainer := targetPod.Spec.Containers[0]
+
+			jobName := "test-build-with-env-steps"
+			data := j.readJenkinsJobUsingVars("build-with-exec-steps.xml", oc.Namespace(), map[string]string{
+				"POD_NAME":       targetPod.Name,
+				"CONTAINER_NAME": targetContainer.Name,
+			})
+
+			j.createItem(jobName, data)
+			jmon := j.startJob(jobName)
+			jmon.await(2 * time.Minute)
+
+			log, err := j.getLastJobConsoleLogs(jobName)
+			ginkgolog("\n\nJenkins logs>\n%s\n\n", log)
+			o.Expect(err).NotTo(o.HaveOccurred())
+
+			o.Expect(strings.Contains(log, "hello world 1")).To(o.BeTrue())
+
+			// Now run without specifying container
+			jobName = "test-build-with-env-steps-no-container"
+			data = j.readJenkinsJobUsingVars("build-with-exec-steps.xml", oc.Namespace(), map[string]string{
+				"POD_NAME":       targetPod.Name,
+				"CONTAINER_NAME": "",
+			})
+
+			j.createItem(jobName, data)
+			jmon = j.startJob(jobName)
+			jmon.await(2 * time.Minute)
+
+			log, err = j.getLastJobConsoleLogs(jobName)
+			ginkgolog("\n\nJenkins logs>\n%s\n\n", log)
+			o.Expect(err).NotTo(o.HaveOccurred())
+
+			o.Expect(strings.Contains(log, "hello world 1")).To(o.BeTrue())
+
 		})
 
 		g.It("jenkins-plugin test multitag", func() {
